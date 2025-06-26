@@ -2251,25 +2251,25 @@ def create_user_menu(
         ],
         [
             InlineKeyboardButton(
-                text="📥 Получить конфиг OpenVPN",
+                text="📥 Получить OpenVPN",
                 callback_data=f"select_openvpn_{client_name}"
             )
         ],
         [
             InlineKeyboardButton(
-                text="🌐 Получить WireGuard",
+                text="🌐 Получить WireGuardVPN",
                 callback_data=f"get_wg_{client_name}"
             )
         ],
         [
             InlineKeyboardButton(
-                text="🦄 Получить Amnezia",
+                text="🦄 Получить AmneziaVPN",
                 callback_data=f"get_amnezia_{client_name}"
             )
         ],
         [
             InlineKeyboardButton(
-                text="📬 Получить VLESS",
+                text="📬 Получить VLESSVPN",
                 callback_data=f"get_vless_{client_name}"
             )
         ],
@@ -2314,14 +2314,8 @@ def create_user_menu(
         # для обычного пользователя
         keyboard.append([
             InlineKeyboardButton(
-                text="💬 Связь с поддержкой",
-                url="https://t.me/vatakatru"
-            )
-        ])
-        keyboard.append([
-            InlineKeyboardButton(
-                text="ℹ️ Как пользоваться",
-                url="https://bi4i.ru/install/"
+                text="Связаться поддержкой",
+                url="https://t.me/chechenecp"
             )
         ])
 
