@@ -33,10 +33,18 @@ import platform
 import socket
 import json
 import shutil
+import yookassa
+from yookassa import Configuration, Payment
+
+# Настройка ЮKassa
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
+YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY")
+Configuration.configure(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
 
 # Новое состояние для платежей
 class PaymentStates(StatesGroup):
     waiting_for_amount = State()
+    waiting_for_payment_confirmation = State()
 
 class SetEmoji(StatesGroup):
     waiting_for_emoji = State()
@@ -61,7 +69,7 @@ class VPNSetup(StatesGroup):
 class AdminAnnounce(StatesGroup):
     waiting_for_text = State()
 
-# Инициализация базы данных с таблицей балансов
+# Инициализация базы данных с таблицей балансов и платежей
 def init_db(db_path):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -70,6 +78,15 @@ def init_db(db_path):
             id INTEGER PRIMARY KEY,
             profile_name TEXT,
             balance REAL DEFAULT 0.0
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            payment_id TEXT PRIMARY KEY,
+            user_id INTEGER,
+            amount REAL,
+            status TEXT,
+            created_at TIMESTAMP
         )
     """)
     conn.commit()
@@ -104,6 +121,34 @@ def update_user_balance(user_id, amount, db_path="/root/vpn.db"):
     cur.execute("UPDATE users SET balance = balance + ? WHERE id=?", (amount, user_id))
     conn.commit()
     conn.close()
+
+# Сохранение информации о платеже
+def save_payment(payment_id, user_id, amount, status, db_path="/root/vpn.db"):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO payments (payment_id, user_id, amount, status, created_at) VALUES (?, ?, ?, ?, ?)",
+        (payment_id, user_id, amount, status, datetime.now(timezone.utc))
+    )
+    conn.commit()
+    conn.close()
+
+# Обновление статуса платежа
+def update_payment_status(payment_id, status, db_path="/root/vpn.db"):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("UPDATE payments SET status=? WHERE payment_id=?", (status, payment_id))
+    conn.commit()
+    conn.close()
+
+# Получение статуса платежа
+def get_payment_info(payment_id, db_path="/root/vpn.db"):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, amount, status FROM payments WHERE payment_id=?", (payment_id,))
+    res = cur.fetchone()
+    conn.close()
+    return {"user_id": res[0], "amount": res[1], "status": res[2]} if res else None
 
 # Получение списка всех пользователей и их балансов
 def get_all_users_balances(db_path="/root/vpn.db"):
@@ -142,6 +187,8 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в .env")
 if not ADMIN_ID:
     raise RuntimeError("ADMIN_ID не задан в .env")
+if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+    raise RuntimeError("YOOKASSA_SHOP_ID или YOOKASSA_SECRET_KEY не заданы в .env")
 ADMIN_ID = int(ADMIN_ID)
 
 ITEMS_PER_PAGE = 5
@@ -152,7 +199,32 @@ dp = Dispatcher()
 print(f"=== BOT START ===")
 print(f"BOT_TOKEN starts with: {BOT_TOKEN[:8]}...")
 print(f"ADMIN_ID: {ADMIN_ID} ({type(ADMIN_ID)})")
+print(f"YOOKASSA_SHOP_ID: {YOOKASSA_SHOP_ID[:8]}...")
 print(f"==================")
+
+# Создание платежа через ЮKassa
+def create_payment(user_id, amount):
+    idempotence_key = str(uuid.uuid4())
+    payment = Payment.create({
+        "amount": {
+            "value": f"{amount:.2f}",
+            "currency": "RUB"
+        },
+        "confirmation": {
+            "type": "redirect",
+            "return_url": "https://your-bot-domain.com/return"  # Замените на ваш URL
+        },
+        "capture": True,
+        "description": f"Пополнение баланса для пользователя {user_id}",
+        "metadata": {"user_id": user_id}
+    }, idempotence_key)
+    save_payment(payment.id, user_id, amount, payment.status)
+    return payment
+
+# Проверка статуса платежа
+async def check_payment_status(payment_id):
+    payment = Payment.find_one(payment_id)
+    return payment.status
 
 # Модифицированное меню пользователя с балансом и кнопкой пополнения
 def create_user_menu(client_name, back_callback="main_menu", is_admin=False, user_id=None):
@@ -791,24 +863,100 @@ async def process_payment_amount(message: types.Message, state: FSMContext):
     except:
         pass
 
-    # Заглушка для интеграции с платежной системой
-    # Здесь должен быть вызов API платежного провайдера (например, YooKassa или Stripe)
-    # Для примера просто увеличиваем баланс
-    update_user_balance(user_id, amount)
-    await safe_send_message(
-        user_id,
-        f"✅ Баланс успешно пополнен на {amount:.2f} RUB!\nТекущий баланс: {get_user_balance(user_id):.2f} RUB"
-    )
-    await notify_admin_payment(user_id, amount)
+    # Создаем платеж через ЮKassa
+    try:
+        payment = create_payment(user_id, amount)
+        confirmation_url = payment.confirmation.confirmation_url
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатить", url=confirmation_url)],
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data="cancel_payment")]
+        ])
+        msg = await bot.send_message(
+            user_id,
+            f"💸 Для пополнения баланса на {amount:.2f} RUB перейдите по ссылке для оплаты:",
+            reply_markup=markup
+        )
+        await state.set_state(PaymentStates.waiting_for_payment_confirmation)
+        await state.update_data(payment_id=payment.id, amount=amount, message_id=msg.message_id)
+    except Exception as e:
+        await bot.send_message(user_id, f"❌ Ошибка при создании платежа: {str(e)}")
+        await state.clear()
+        client_name = get_profile_name(user_id)
+        await show_menu(
+            user_id,
+            f"Меню пользователя <b>{client_name}</b>:",
+            create_user_menu(client_name, user_id=user_id)
+        )
 
-    # Возвращаем пользователя в меню
+# Обработчик отмены платежа
+@dp.callback_query(lambda c: c.data == "cancel_payment")
+async def cancel_payment(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await delete_last_menus(user_id)
+    await state.clear()
     client_name = get_profile_name(user_id)
     await show_menu(
         user_id,
         f"Меню пользователя <b>{client_name}</b>:",
         create_user_menu(client_name, user_id=user_id)
     )
-    await state.clear()
+    await callback.message.delete()
+    await callback.answer("Платеж отменен")
+
+# Обработчик проверки статуса платежа
+@dp.callback_query(lambda c: c.data.startswith("check_payment_"))
+async def check_payment(callback: types.CallbackQuery, state: FSMContext):
+    payment_id = callback.data.split("_")[2]
+    user_id = callback.from_user.id
+    data = await state.get_data()
+    amount = data.get("amount")
+    
+    try:
+        status = await check_payment_status(payment_id)
+        update_payment_status(payment_id, status)
+        
+        if status == "succeeded":
+            update_user_balance(user_id, amount)
+            await callback.message.edit_text(
+                f"✅ Платеж на {amount:.2f} RUB успешно завершен!\nТекущий баланс: {get_user_balance(user_id):.2f} RUB",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ В меню", callback_data=f"back_to_user_menu_{get_profile_name(user_id)}")]
+                ])
+            )
+            await notify_admin_payment(user_id, amount)
+            await state.clear()
+        elif status == "canceled":
+            await callback.message.edit_text(
+                "❌ Платеж был отменен.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ В меню", callback_data=f"back_to_user_menu_{get_profile_name(user_id)}")]
+                ])
+            )
+            await state.clear()
+        else:
+            await callback.message.edit_text(
+                f"⏳ Платеж находится в статусе: {status}. Пожалуйста, подождите.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Проверить снова", callback_data=f"check_payment_{payment_id}")]
+                ])
+            )
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Ошибка при проверке платежа: {str(e)}")
+        await state.clear()
+    await callback.answer()
+
+# Обработчик возврата в меню пользователя
+@dp.callback_query(lambda c: c.data.startswith("back_to_user_menu_"))
+async def back_to_user_menu(callback: types.CallbackQuery):
+    client_name = callback.data.split("_")[-1]
+    user_id = callback.from_user.id
+    await delete_last_menus(user_id)
+    await show_menu(
+        user_id,
+        f"Меню пользователя <b>{client_name}</b>:",
+        create_user_menu(client_name, user_id=user_id)
+    )
+    await callback.answer()
 
 # Уведомление админа о пополнении
 async def notify_admin_payment(user_id, amount):
@@ -837,11 +985,48 @@ async def show_balance(callback: types.CallbackQuery):
     )
     await callback.answer()
 
+# Функция для периодической проверки незавершенных платежей
+async def check_pending_payments():
+    while True:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT payment_id, user_id, amount FROM payments WHERE status IN ('pending', 'waiting_for_capture')")
+        payments = cur.fetchall()
+        conn.close()
+        
+        for payment_id, user_id, amount in payments:
+            try:
+                status = await check_payment_status(payment_id)
+                update_payment_status(payment_id, status)
+                if status == "succeeded":
+                    update_user_balance(user_id, amount)
+                    client_name = get_profile_name(user_id)
+                    await safe_send_message(
+                        user_id,
+                        f"✅ Платеж на {amount:.2f} RUB успешно завершен!\nТекущий баланс: {get_user_balance(user_id):.2f} RUB",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="⬅️ В меню", callback_data=f"back_to_user_menu_{client_name}")]
+                        ])
+                    )
+                    await notify_admin_payment(user_id, amount)
+                elif status == "canceled":
+                    await safe_send_message(
+                        user_id,
+                        "❌ Платеж был отменен.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="⬅️ В меню", callback_data=f"back_to_user_menu_{get_profile_name(user_id)}")]
+                        ])
+                    )
+            except Exception as e:
+                print(f"Ошибка при проверке платежа {payment_id}: {e}")
+        await asyncio.sleep(60)  # Проверять каждые 60 секунд
+
 # Остальной код остается без изменений
 # ... (все остальные функции и обработчики из исходного кода)
 
 async def main():
     print("✅ Бот успешно запущен!")
+    asyncio.create_task(check_pending_payments())  # Запускаем фоновую проверку платежей
     asyncio.create_task(notify_expiring_users())
     await set_bot_commands()
     await dp.start_polling(bot)
